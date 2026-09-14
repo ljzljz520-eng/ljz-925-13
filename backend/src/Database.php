@@ -197,6 +197,19 @@ class Database
                 self::getInstance()->exec('ALTER TABLE license_key ADD COLUMN key_encrypted TEXT');
             }
 
+            // 兼容旧库：早期版本未包含 key_batch.remark 字段
+            $batchColumns = self::query("PRAGMA table_info(key_batch)");
+            $hasRemark = false;
+            foreach ($batchColumns as $col) {
+                if (($col['name'] ?? null) === 'remark') {
+                    $hasRemark = true;
+                    break;
+                }
+            }
+            if (!$hasRemark) {
+                self::getInstance()->exec("ALTER TABLE key_batch ADD COLUMN remark VARCHAR(255) DEFAULT ''");
+            }
+
             // 检查是否需要执行seed.sql（如果admin_user表为空且不是测试环境）
             $isTestEnv = getenv('APP_ENV') === 'testing';
             if (!$isTestEnv) {

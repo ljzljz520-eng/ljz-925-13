@@ -9,26 +9,123 @@ namespace App;
 class KeyManager
 {
     /**
+     * 卡密总长度（含前缀）
+     */
+    public const KEY_LENGTH = 12;
+
+    /**
+     * 预览批量生成卡密（只生成不写入数据库）
+     * 生成的卡密在批次内去重，并排除数据库中已存在的卡密
+     *
+     * @param string $prefix 前缀
+     * @param int $count 数量
+     * @return array 明文卡密数组
+     * @throws \RuntimeException 生成失败时抛出
+     */
+    public static function previewKeys(string $prefix, int $count): array
+    {
+        $keys = [];
+        $guard = 0;
+        $maxGuard = max(100, $count * 50);
+
+        // 生成并在批次内去重
+        while (count($keys) < $count && $guard < $maxGuard) {
+            $guard++;
+            $candidate = self::generateKey($prefix, self::KEY_LENGTH);
+            $keys[$candidate] = true;
+        }
+
+        if (count($keys) < $count) {
+            throw new \RuntimeException('卡密生成失败，请更换前缀后重试');
+        }
+
+        // 排除数据库中已存在的卡密，冲突时补充生成
+        $attempts = 0;
+        while ($attempts < 10) {
+            $attempts++;
+            $existing = self::findExistingKeys(array_keys($keys));
+            if (empty($existing)) {
+                return array_keys($keys);
+            }
+
+            foreach ($existing as $key) {
+                unset($keys[$key]);
+            }
+
+            $guard = 0;
+            while (count($keys) < $count && $guard < $maxGuard) {
+                $guard++;
+                $keys[self::generateKey($prefix, self::KEY_LENGTH)] = true;
+            }
+
+            if (count($keys) < $count) {
+                throw new \RuntimeException('卡密生成失败，请更换前缀后重试');
+            }
+        }
+
+        throw new \RuntimeException('卡密与现有数据冲突过多，请更换前缀后重试');
+    }
+
+    /**
+     * 查找数据库中已存在的卡密
+     *
+     * @param array $keys 明文卡密数组
+     * @return array 已存在的明文卡密数组
+     */
+    private static function findExistingKeys(array $keys): array
+    {
+        $existing = [];
+
+        foreach (array_chunk($keys, 500) as $chunk) {
+            $hashes = array_map([Auth::class, 'hashKey'], $chunk);
+            $placeholders = implode(',', array_fill(0, count($hashes), '?'));
+            $rows = Database::query(
+                "SELECT key_hash FROM license_key WHERE key_hash IN ($placeholders)",
+                $hashes
+            );
+            $existingHashes = array_flip(array_column($rows, 'key_hash'));
+
+            foreach ($chunk as $index => $key) {
+                if (isset($existingHashes[$hashes[$index]])) {
+                    $existing[] = $key;
+                }
+            }
+        }
+
+        return $existing;
+    }
+
+    /**
      * 批量生成卡密
      *
      * @param string $prefix 前缀
      * @param int $count 数量
      * @param int $expireDays 有效期（天）
      * @param int $adminId 管理员ID
-     * @return array ['keys' => array, 'batch_id' => int]
+     * @param string $remark 备注
+     * @param array|null $preGeneratedKeys 预览阶段已生成的明文卡密（确认写入时传入）
+     * @return array ['keys' => array, 'batch_id' => int, 'count' => int]
      */
-    public static function generateKeys(string $prefix, int $count, int $expireDays, int $adminId): array
-    {
-        $keys = [];
+    public static function generateKeys(
+        string $prefix,
+        int $count,
+        int $expireDays,
+        int $adminId,
+        string $remark = '',
+        ?array $preGeneratedKeys = null
+    ): array {
+        // 优先使用预览阶段生成的卡密，保证预览与写入结果一致
+        $keys = $preGeneratedKeys ?? self::previewKeys($prefix, $count);
+        $count = count($keys);
 
         try {
             Database::beginTransaction();
 
             // 创建批次记录
             Database::execute(
-                "INSERT INTO key_batch (prefix, count, expire_days, created_by, created_at)
-                 VALUES (?, ?, ?, ?, datetime('now', 'localtime'))",
-                [$prefix, $count, $expireDays, $adminId]
+                "INSERT INTO key_batch (prefix, count, expire_days, remark, created_by, created_at)
+                 VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))",
+                [$prefix, $count, $expireDays, $remark, $adminId]
             );
 
             $batchId = (int) Database::lastInsertId();
@@ -37,8 +134,7 @@ class KeyManager
             $expireAt = date('Y-m-d H:i:s', strtotime("+{$expireDays} days"));
 
             // 生成卡密
-            for ($i = 0; $i < $count; $i++) {
-                $keyPlain = self::generateKey($prefix, 12);
+            foreach ($keys as $keyPlain) {
                 $keyHash = Auth::hashKey($keyPlain);
                 $keyEncrypted = Crypto::encrypt($keyPlain);
 
@@ -48,22 +144,21 @@ class KeyManager
                      VALUES (?, ?, ?, 'active', ?, datetime('now', 'localtime'))",
                     [$batchId, $keyHash, $keyEncrypted, $expireAt]
                 );
-
-                $keys[] = $keyPlain;
             }
 
             Database::commit();
 
             // 记录管理员操作日志
-            Logger::logAdminOp(
-                $adminId,
-                'generate_keys',
-                "生成{$count}个卡密，前缀：{$prefix}，有效期：{$expireDays}天"
-            );
+            $logDetail = "生成{$count}个卡密，前缀：{$prefix}，有效期：{$expireDays}天";
+            if ($remark !== '') {
+                $logDetail .= "，备注：{$remark}";
+            }
+            Logger::logAdminOp($adminId, 'generate_keys', $logDetail);
 
             return [
                 'keys' => $keys,
-                'batch_id' => $batchId
+                'batch_id' => $batchId,
+                'count' => $count
             ];
 
         } catch (\Exception $e) {

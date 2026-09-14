@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS key_batch (
     prefix VARCHAR(10) DEFAULT '',
     count INTEGER NOT NULL,
     expire_days INTEGER NOT NULL,
+    remark VARCHAR(255) DEFAULT '',
     created_by INTEGER NOT NULL,
     created_at DATETIME NOT NULL DEFAULT (datetime('now', 'localtime')),
     FOREIGN KEY (created_by) REFERENCES admin_user(id)

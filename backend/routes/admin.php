@@ -70,6 +70,29 @@ function requireAdminAuthWithUrlToken() {
     return $_SESSION['admin_id'];
 }
 
+// 卡密生成参数校验（预览与确认写入共用）
+function validateKeyGenerationParams(string $prefix, int $count, int $expireDays, string $remark) {
+    if ($count < 1 || $count > 1000) {
+        Response::jsonError(4003, '生成数量必须在1-1000之间');
+    }
+
+    if ($expireDays < 1 || $expireDays > 3650) {
+        Response::jsonError(4003, '有效期必须在1-3650天之间');
+    }
+
+    if (mb_strlen($prefix) > 4) {
+        Response::jsonError(4003, '前缀长度不能超过4个字符');
+    }
+
+    if ($prefix !== '' && !preg_match('/^[A-Z0-9]+$/', $prefix)) {
+        Response::jsonError(4003, '前缀只能包含字母和数字');
+    }
+
+    if (mb_strlen($remark) > 100) {
+        Response::jsonError(4003, '备注长度不能超过100个字符');
+    }
+}
+
 // POST /api/admin/login - 管理员登录
 if ($path === 'api/admin/login' && $method === 'POST') {
     $input = json_decode(file_get_contents('php://input'), true);
@@ -157,34 +180,92 @@ elseif ($path === 'api/admin/keys' && $method === 'GET') {
     Response::jsonSuccess($result);
 }
 
-// POST /api/admin/keys/generate - 批量生成卡密
+// POST /api/admin/keys/preview - 预览批量生成卡密（只生成不写入数据库）
+elseif ($path === 'api/admin/keys/preview' && $method === 'POST') {
+    requireAdminAuth();
+
+    $input = json_decode(file_get_contents('php://input'), true);
+    $prefix = strtoupper(trim((string)($input['prefix'] ?? '')));
+    $count = (int)($input['count'] ?? 0);
+    $expireDays = (int)($input['expireDays'] ?? 0);
+    $remark = trim((string)($input['remark'] ?? ''));
+
+    // 验证（前缀过长、数量过大等在此拦截）
+    validateKeyGenerationParams($prefix, $count, $expireDays, $remark);
+
+    try {
+        $keys = KeyManager::previewKeys($prefix, $count);
+    } catch (Exception $e) {
+        Response::jsonError(5000, '预览失败：' . $e->getMessage());
+    }
+
+    // 预览结果暂存会话，确认写入时原样落库，保证预览与写入一致
+    $previewToken = bin2hex(random_bytes(16));
+    $_SESSION['pending_key_preview'] = [
+        'token' => $previewToken,
+        'prefix' => $prefix,
+        'count' => $count,
+        'expire_days' => $expireDays,
+        'remark' => $remark,
+        'keys' => $keys,
+        'created_at' => time()
+    ];
+
+    Response::jsonSuccess([
+        'token' => $previewToken,
+        'keys' => $keys,
+        'count' => $count,
+        'prefix' => $prefix,
+        'expireDays' => $expireDays,
+        'remark' => $remark,
+        'expireAt' => date('Y-m-d H:i:s', strtotime("+{$expireDays} days"))
+    ], '预览生成成功，确认后写入数据库');
+}
+
+// POST /api/admin/keys/generate - 确认写入预览的卡密
 elseif ($path === 'api/admin/keys/generate' && $method === 'POST') {
     $adminId = requireAdminAuth();
 
     $input = json_decode(file_get_contents('php://input'), true);
-    $prefix = $input['prefix'] ?? '';
-    $count = (int)($input['count'] ?? 0);
-    $expireDays = (int)($input['expireDays'] ?? 30);
+    $previewToken = (string)($input['previewToken'] ?? '');
 
-    // 验证
-    if ($count < 1 || $count > 1000) {
-        Response::jsonError(4003, '生成数量必须在1-1000之间');
+    $pending = $_SESSION['pending_key_preview'] ?? null;
+
+    if (
+        $previewToken === '' ||
+        !is_array($pending) ||
+        empty($pending['token']) ||
+        !hash_equals((string)$pending['token'], $previewToken)
+    ) {
+        Response::jsonError(4004, '请先预览生成结果，再确认写入');
     }
 
-    if ($expireDays < 1 || $expireDays > 3650) {
-        Response::jsonError(4003, '有效期必须在1-3650天之间');
-    }
-
-    if (strlen($prefix) > 4) {
-        Response::jsonError(4003, '前缀长度不能超过4个字符');
+    // 预览结果10分钟内有效
+    if (time() - (int)($pending['created_at'] ?? 0) > 600) {
+        unset($_SESSION['pending_key_preview']);
+        Response::jsonError(4004, '预览已过期，请重新预览');
     }
 
     try {
-        $result = KeyManager::generateKeys($prefix, $count, $expireDays, $adminId);
-        Response::jsonSuccess($result, "成功生成{$count}个卡密");
+        $result = KeyManager::generateKeys(
+            (string)$pending['prefix'],
+            (int)$pending['count'],
+            (int)$pending['expire_days'],
+            $adminId,
+            (string)($pending['remark'] ?? ''),
+            $pending['keys']
+        );
     } catch (Exception $e) {
         Response::jsonError(5000, '生成失败：' . $e->getMessage());
     }
+
+    // 写入成功后清除预览，防止重复提交
+    unset($_SESSION['pending_key_preview']);
+
+    Response::jsonSuccess([
+        'keys' => $result['keys'],
+        'count' => $result['count']
+    ], "成功生成{$result['count']}个卡密");
 }
 
 // POST /api/admin/keys/ban - 批量封禁卡密
